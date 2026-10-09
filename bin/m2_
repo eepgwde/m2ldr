@@ -1,0 +1,2355 @@
+#!/bin/bash
+
+# This is the super-script. It provides a wrapper around other scripts.
+# It is documented by a /usr/local/share/man/cat1 page.
+
+# developer only - _M__TRACE_ in the environment
+if [[ -n "${_M__TRACE_:-}" ]]; then
+  [[ "$_M__TRACE_" == *d* ]] && set -x
+fi
+
+# set the default for site-wide trace to "-"
+if [[ -z "${_M__TRACE_}" ]]; then
+  _M__TRACE_="-"
+fi
+
+# for the module loader, the default is the current directory
+if [[ -z "${_M__LOADR_}" ]]; then
+  _M__LOADR_="."
+fi
+
+# Set of names for variables used by e_env and others
+# These are mapped to getopts
+readonly _M__VARS_=(dir file count password log user exec options output port ref aflag service)
+
+# Others
+# _M_GLOBAL_LOG_LVL
+# _M_FIFO_OWNED="no"
+
+# echo _M__TRACE_ $_M__TRACE_
+# echo _M__LOADR_ $_M__LOADR_
+
+## Recommendations:
+# Function prefixes: d_ public command-line ; e_ public internal ; f_ protected internal
+# Variables: d_ public command-line switches ; e_ public internal ; _M__<name>_ private internal
+# Indirect variables: suffix _v
+
+declare -r _M__VER_=1.2
+declare -r _M__DESC_="script loading uses VPATHs, logging uses a file descriptor and forces set -u "
+
+# if invoked with tracing
+if [ "${SHELLOPTS}" != "${SHELLOPTS%%xtrace}" ]
+then
+  xtrace="yes"
+fi
+
+## initial logging to stderr
+# --- PHASE 1: Bootstrap Logging ---
+# Send everything to stderr so we catch syntax errors during load
+
+## logging
+# We may now be running new code that uses /dev/fd/7
+# This function is defined here, because we want to change the logging to stderr
+# if we have not inherited a definition of /dev/fd/7
+f_log_state () {
+  if [[ -e "$1" ]]; then
+    local target=$(readlink "$1")
+    local serr=$(readlink /dev/fd/2)
+    local snull=$(readlink /dev/null)
+    echo "$0: $1 : $target : fd2 : $serr" >&7
+    # logging to stderr is fine
+    [[ $target == $serr ]] && _M__LOG_=1
+    # logging to null is no logging
+    [[ $target == $snull ]] && _M__LOG_=2
+    # logging to somewhere else
+    _M__LOG_=3
+  fi
+}
+
+# Later, only if _M__LOG_ is zero can we close the /dev/fd/7
+typeset -i _M__LOG_=-1
+# who set the logging if /dev/fd/7 has been set, then leave it as it is.
+f_log_state /dev/fd/7
+if (( _M__LOG_ < 0 )); then
+  # we temporarily set it to stderr and mark ownership
+  (( _M__LOG_=0 ))
+  exec 7>&2
+fi
+
+f_cmd=""
+
+## Operational mode
+# Three types of script x__ x_ and x
+# x__ system script /usr/local only; x_ user directory and /usr/local; x source directory only
+# different VPATH for each
+
+# We may have redirected the program to another using an exec call
+# we can pass the original engine identity via an environment variable
+# it is immediately unset to ensure it doesn't confuse forked programs
+# The final implementation used is also recorded
+declare -r d_interface=${_M__ENGN_ID0_:-${0##*/}}
+[[ -v _M__ENGN_ID0_ ]] && unset _M__ENGN_ID0_
+declare -r d_implementation="$(readlink -e $0)"
+
+declare -r prog=${0##*/}
+declare -r prog_args="$*"
+# Don't use realpath for the $0, but for the directory it is in
+declare -r prog_dir="$(realpath "$(dirname "$0")")"
+
+## General Utilities for this script
+#
+
+## TODO For developers using nodo and logging
+# Write to the logger not a target file if nodo is not empty.
+# Add log device
+
+## Add variables via options or exec or any string
+# Expect a name of an environment variable which has a value like this
+#   abc=def,ghi=jkl
+#
+d_evlr () {
+  local var_name="$1"
+  local raw_value="${!var_name}"
+  [[ -z "$raw_value" ]] && return 0
+
+  local IFS=","
+  for pair in $raw_value; do
+    # Extract key and value safely
+    # ${pair%%=*} gets everything before the first '='
+    # ${pair#*=}  gets everything after the first '='
+    local key="${pair%%=*}"
+    local val="${pair#*=}"
+
+    # Validation: Ensure key is a valid variable name (alphanumeric/underscore)
+    # and that an '=' actually existed in the pair
+    if [[ "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && [[ "$pair" == *"="* ]]; then
+      # printf -v performs the assignment: key=val
+      printf -v "$key" "%s" "$val"
+
+      # Optional: If you want to see what happened during -x trace
+      # [[ "${VERBOSE:-}" == "yes" ]] && echo "Option Set: $key='$val'" >&2
+    fi
+  done
+}
+
+# unused
+e_nodo () {
+  if [ -z "$nodo" ]; then
+	  cat > "$1"
+  else
+	  cat
+  fi
+}
+
+## Temporary files : remove temporary files on exit using f_tpush
+# If no argument is given it will create a temporary file for you and return its path
+# If the file is already in the list don't push it again.
+# Was mis-named as f_tpush - that function is now a wrapper to this.
+
+# This is now the base function, it uses name-refs
+# It only manages TFILES as a set. It is annoyingly noisy
+f_tpush0() { # $1 file being added to set
+  # Case 2: Register an existing file (One argument)
+
+  local -i restore_x=0
+
+  # Check if 'x' is present in the current shell options ($-)
+  if [[ $- == *x* ]]; then
+    (( restore_x=1 ))
+    set +x  # Turn it off
+  fi
+
+  local candidate="$1"
+  # Hardlink check: Don't double-register the same inode
+  for existing in "${TFILES[@]:-}"; do
+    [[ -e "$candidate" && -e "$existing" && "$candidate" -ef "$existing" ]] && return 0
+  done
+
+  TFILES+=("$candidate")
+
+  # restore trace
+  if (( restore_x > 0 )); then
+    set -x
+  fi
+}
+
+
+## Get a temporary file or register files as temporary
+# Legacy mode: if one or more arguments are given these are registered with TFILES.
+# New mode: if no arguments given, echoes a temporary file to stdout
+e_tpush() {
+  # Case 1: Create and return a new file (No arguments) - legacy variant
+  if [[ $# -eq 0 ]]; then
+    local target
+    target=$(mktemp)
+    TFILES+=("$target")         # file is genuinely new so no need to use f_tpush0
+    echo "$target"
+    return 0
+  fi
+
+  local i
+  for i in $@; do
+    f_tpush0 "$1"
+  done
+}
+
+# The Nameref Wrapper: Sets a variable to a new temp file path
+e_tpush1() {
+  if [[ $# -lt 1 ]]; then
+    d_ERRMSG="[${FUNCNAME[0]}] Usage: $FUNCNAME <var_name>"
+    return 1
+  fi
+
+  # Declare nameref to the variable name provided by the developer
+  local -n __target_var="$1"
+
+  local target
+  target=$(mktemp)
+  TFILES+=("$target")         # file is genuinely new so no need to use f_tpush0
+
+  # Generate the file via the worker and assign it directly
+  __target_var="$target"
+}
+
+# Legacy Compatibility
+# ignore all but one command-line argument
+f_tpush () {
+  e_tpush "$1"
+}
+
+## No Unset
+# These functions will be run at the end of the script and will be running under
+# set -o nounset, so lots of precautions taking for undefined variables.
+
+## Exiting from a function
+# There is an err_level. The VERBOSE variable may be set and the developer is allowed to provide
+# d_ERRMSG.
+
+f_vpath_unique() {
+  # Simplifies a VPATH before use.
+  # Takes the NAME of the array variable as an argument
+  local -n input_vpath=$1
+  local -a unique_list=()
+  declare -A seen_identities
+
+  for dir in "${input_vpath[@]}"; do
+    # 1. Skip null/empty strings immediately
+    [[ -z "$dir" ]] && continue
+
+    # 2. Early Exit: Check if directory exists AND is searchable (-x)
+    # This prevents 'stat' from failing on permission-denied paths
+    if [[ -d "$dir" && -x "$dir" ]]; then
+
+      # 3. Get Physical Identity (Device ID : Inode)
+      # -L follows symlinks to ensure we identify the REAL source
+      # This handles bind mounts and symlinked config dirs perfectly.
+      local identity
+      identity=$(stat -L -c '%d:%i' "$dir" 2>/dev/null) || continue
+
+      # 4. De-duplication check
+      if [[ -z "${seen_identities[$identity]:-}" ]]; then
+        unique_list+=("$dir")
+        seen_identities["$identity"]=1
+      fi
+    fi
+  done
+
+  # 5. Overwrite the original array with the cleaned version
+  input_vpath=("${unique_list[@]}")
+}
+
+## Special loader for JIT loading for the wrapper script
+f_vpath_mldr () {
+  local -n arg1_r=$1
+  local -n arg2_r=$2
+  local xsrc="$(readlink -e "$0")"
+  # local xprog="${ }"
+
+  local pth=""
+  e_path_parse "$xsrc" "pth"
+  # declare -p pth
+  local base0="${pth[$_M_P_BASE]}"
+  local dir0="${pth[$_M_P_DIR]}"
+  local top0="$(realpath "$dir0/..")"
+
+  # echo $xsrc
+  # echo base0 : $base0
+  # echo dir0 : $dir0
+  # echo top0 : $top0
+
+  local -a paths=(
+    "$top0/etc"
+    "$top0/share/site/cluster"
+    "$top0/share/site/$machine_name"
+  )
+
+  arg1_r=("${paths[@]}")
+  arg2_r="${base0}"
+
+  return 0
+}
+
+## load locations
+# This is important. Search for files .sh or .def that match prog.
+
+f_vpath_files() {
+  # Find the files on the VPATH
+  # no need to check inodes in this version because the VPATH has been made unique
+  local ext="$1"
+  local nprog="${2:-${prog}}"
+  local target_var="FOUND_${ext^^}"
+  local -n current_vpath="${3:-$THIS_VPATH_NAME}"
+  local -n list="$target_var"
+
+  for dir in "${current_vpath[@]}"; do
+    local candidate="$dir/$nprog.$ext"
+    if [[ -s "$candidate" ]]; then
+      # echo "# $FUNCNAME candidate = $candidate" >&7
+      # safe works with inode safety
+      # list+=("$(realpath "$candidate")")
+      # easier to understand
+      list+=("$candidate")
+    fi
+  done
+}
+
+# Wrapper calls
+f_vpath_sh() {
+  f_vpath_files "${FUNCNAME#f_vpath_}"
+}
+f_vpath_def() {
+  f_vpath_files "${FUNCNAME#f_vpath_}"
+}
+
+# e_is_logging: Returns "yes" if any logging is enabled, else ""
+e_is_logging() {
+  local log_lvl_v="${prog}_logging_lvl"
+  # Resolve the indirect variable. If > 0, we are verbose.
+  if [[ ${!log_lvl_v:-0} -gt 0 ]]; then
+    echo "yes"
+  else
+    echo ""
+  fi
+}
+
+## main
+# The Main Execution Gate
+f_main() {
+  local cmd="${d_cmd_default:-help}"
+  local x_cmd=""
+  local is_stateful="${d_stateful:-0}"
+
+  # 0. Initial Resolve of command from $1
+  if [[ $# -ge 1 ]]; then
+    cmd="$1"; shift
+  fi
+
+  # 1. Identity Mapping
+  if [[ -n "${d_helpflag:-}" ]]; then
+    x_cmd="h_${cmd}"
+  elif [[ "$is_stateful" -ne 0 ]]; then
+    x_cmd="s_${cmd}"
+  else
+    x_cmd="d_${cmd}"
+  fi
+
+  # 2. Just-In-Time Resolution for the Target Command
+  # If the function isn't in memory, try to load it from the .sh library
+  if ! declare -F "$x_cmd" >/dev/null; then
+    if ! d_resolve1 "$x_cmd"; then
+      # d_resolve1 sets d_ERRMSG on failure
+      return $?
+    fi
+  fi
+
+  # 3. Stateful Engine Infrastructure Loading
+  if [[ "$is_stateful" -ne 0 ]]; then
+    # We look for the "Marker" function e_bus_load in the caller's base library
+    local y_cmd="e_bus_load"
+    local y_cmd_src=""
+
+    if ! declare -F "$y_cmd" >/dev/null; then
+      # We ask d_resolve1 to find the function in $CLLR_BASE and capture the file path
+      if ! d_resolve1 "$y_cmd" "${CLLR_BASE:-}" "y_cmd_src"; then
+        # d_resolve1 sets d_ERRMSG on failure
+        return $?
+      fi
+    fi
+
+    # Instead of running y_cmd, we source the file that contains it.
+    # This populates e_bus_engine, e_bus_init, and the engine function itself.
+    if [[ -f "$y_cmd_src" ]]; then
+      source "$y_cmd_src"
+    else
+      # If it was already in memory, y_cmd_src might be empty.
+      # We only source if d_resolve1 actually provided a path.
+      # If it's already in memory, we assume infrastructure is present.
+      :
+    fi
+
+    # Validation: Ensure the sourcing provided the name of the engine to run
+    if [[ -z "${e_bus_engine:-}" ]]; then
+      d_ERRMSG="[f_main] Failed to find state machine definition variable \"e_bus_engine\" after sourcing ($y_cmd_src)"
+      return 4
+    fi
+
+    # Verify the specific s_ function was actually loaded (safety check)
+    if ! declare -F "$x_cmd" >/dev/null; then
+      d_ERRMSG="[f_main] Stateful function [$x_cmd] not found after resolution."
+      return 8
+    fi
+  fi
+
+  # --- 4. STRICT EXECUTION ZONE ---
+  # Handle xtrace
+  [[ ${xtrace:-} = yes ]] && set -x
+
+  # Handle nounset (Negative logic: default is ON unless nnunset=yes)
+  [[ ${nnunset:-no} != yes ]] && set -u
+
+  f_cmd="${x_cmd}"
+
+  # --- 5. LOGGING / STARTUP TRACE ---
+  if { true >&7; } 2>/dev/null; then
+    local ts
+    ts=$(date +%FT%T.%3N)
+
+    local e_user=$(id -un 2>/dev/null || echo "${USER:-unknown}")
+    local e_host=$(hostname -s 2>/dev/null || echo "${HOSTNAME:-localhost}")
+    local e_pwd="${PWD:-$(pwd)}"
+
+    # Format: Time [PROG:CMD] (PID) Start: user@host:/current/path
+    printf "%s [%s:%s] (%d) Start: %s@%s:%s\n" \
+           "$ts" "$prog" "$f_cmd" "$$" "$e_user" "$e_host" "$e_pwd" >&7
+  fi
+
+  # --- 6. EXECUTION DISPATCH ---
+  if [[ "$is_stateful" -ne 0 ]]; then
+    # Run the engine defined in the sourced file, passing the user function
+    "${e_bus_engine}" "$x_cmd" "$@"
+  else
+    # Standard direct dispatch for d_ or h_ functions
+    ${x_cmd} "$@"
+  fi
+
+  local terr_level=$?
+  err_level=$terr_level         # sync global err_level for the caller
+
+  # Final Error Message Handling
+  if [[ $terr_level -ne 0 && -z "${d_ERRMSG:-}" ]]; then
+    d_ERRMSG="[${f_cmd}] terminated with non-zero exit code (${terr_level})"
+  fi
+
+  # Never return -1; it triggers the ERR trap and can cause races
+  return $terr_level
+}
+
+## Close down
+# Remove any temporary files
+# Close down the logger
+f_trap_exit() {
+  local actual_exit=$?
+  set +u
+
+  # 1. Determine Final Status immediately
+  local final_status=${err_level:-$actual_exit}
+  [[ $final_status -eq 0 && $actual_exit -ne 0 ]] && final_status=$actual_exit
+
+  # 2. LOG THE EXIT (While FD 7 is still open!)
+  if { true >&7; } 2>/dev/null; then
+    local ts=$(date +%FT%T.%3N)
+    printf "%s [%s:%s] (%d) Exit: %d\n" "$ts" "$prog" "$f_cmd" "$$" "$final_status" >&7 || true
+  fi
+
+  # 3. REPORT ERROR (While FD 7 and FD 2 are still open!)
+  # We use final_status here to decide if we speak
+  if [[ $final_status -ne 0 ]]; then
+    # Synchronize err_level so f_err_msg knows the score
+    err_level=$final_status
+    f_err_msg
+  fi
+
+  # Clear temporary files - if verbose leave them for analysis
+  if [[ "${VERBOSE:-no}" != "yes" ]]; then
+    rm -f "${TFILES[@]:-}" 2>/dev/null
+  else
+    # echo "# $prog $FUNCNAME : TFILES : ${TFILES[@]}" >&7
+    true
+  fi
+
+  # NOW CLOSE LOGGING
+  if (( _M__LOG_ == 0 )); then
+    exec 7>&- 2>/dev/null
+
+    if [[ "${_M_FIFO_OWNED:-no}" == "yes" ]]; then
+      sleep 0.1
+      if [[ -p "${!log_dest_v:-}" ]]; then
+        rm -f "${!log_dest_v}" 2>/dev/null
+      fi
+    fi
+  fi
+
+  # allow to be called without exit
+  if [[ -z "$_M__NEXIT_:-" ]]; then
+    exit "$final_status"
+  fi
+}
+
+## Errors, assert and error trap module
+# set -u compliant
+
+f_err_msg() {
+  # If d_ERRMSG is empty, provide a basic fallback
+  if [[ -z "${d_ERRMSG:-}" ]]; then
+    d_ERRMSG="[${prog}] Unknown failure in ${f_cmd} (Status: ${err_level})"
+  fi
+
+  # 1. Force to the Log File (FD 7)
+  if { true >&7; } 2>/dev/null; then
+    echo "$msg" >&7
+  fi
+
+  if [ -z "${d_quiet:-}" ]
+  then
+  # Print the whole block (Error + Appended Stack) to stderr
+  {
+    echo -e "\n\033[1;31m!!! ERROR REPORT !!!\033[0m"
+    echo "$d_ERRMSG";
+    echo -e "\033[1;31m!!!!!!!!!!!!!!!!!!!!\033[0m\n";
+  } >&2
+  fi
+
+  # Clear it so it doesn't double-print if traps overlap
+  d_ERRMSG=""
+}
+
+f_trap_err() {
+  # Capture the specific exit code of the failed command
+  local failed_code=$?
+  # Capture the line number where it happened
+  local line_no=$1
+
+  # Update the global error level so f_trap_exit knows we crashed
+  err_level=$failed_code
+
+  # Optional: Provide a debug message to stderr if VERBOSE is on
+  if [[ "${VERBOSE:-no}" == "yes" ]]; then
+    {
+      echo "${prog}: DEBUG: Command failed at line $line_no with status $failed_code";
+      e_cstack0;
+    } >&2
+  fi
+
+  # f_trap_exit would be triggered automatically after this function returns
+  # if the script exits, but call it now
+  f_trap_exit
+}
+
+## Call stack
+# This places the call stack into the d_ERRMSG variable
+e_cstack0() {
+  # Ensure d_ERRMSG exists to avoid nounset crashes
+  : "${d_ERRMSG:=}"
+
+  d_ERRMSG+=$'\n'"Stack Trace:"
+
+  local i
+  # We use the length of FUNCNAME to bound the loop
+  local stack_depth=${#FUNCNAME[@]}
+
+  for ((i=1; i<stack_depth; i++)); do
+    # Safely extract values with defaults for nounset stability
+    local func="${FUNCNAME[$i]:-unknown}"
+    local src="${BASH_SOURCE[$i]:-unknown}"
+
+    # Calculate the calling line index safely
+    local line_idx=$((i - 1))
+    local line="${BASH_LINENO[$line_idx]:-?}"
+
+    d_ERRMSG+=$'\n'
+    d_ERRMSG+="  -> ${func}() at ${src}:${line}"
+  done
+
+  # Log to >&7 so the developer sees the trace in the log file too
+  echo "$d_ERRMSG" >&7
+
+  return 0
+}
+
+# e_err_report0 (reason)
+# Internal helper to format the global error message and capture the stack.
+e_err_report0() {
+  local __reason="${1:-Unknown Error}"
+
+  # Initialize/Reset the global error message
+  d_ERRMSG="ERROR: ${__reason}"
+
+  # Append the stack trace using your existing logic
+  e_cstack0
+}
+
+# e_err_fatal0 (reason)
+# Reports the error and exits.
+e_err_fatal0() {
+  e_err_report0 "$1"
+  echo "$d_ERRMSG" >&2
+  exit 2
+}
+
+# user assert operation
+e_assert0 () {
+  if [[ $? != 0 ]]
+  then
+    d_ERRMSG="Assertion failed at line: ${1:-0}"
+    d_ERRMSG+=$'\n'  # Adds a newline
+    d_ERRMSG+="Stack Trace:"
+
+    e_cstack0
+
+    exit 2
+  fi
+}
+
+## Pointer Operations
+
+## cycle back through the pointers
+# We create local -n __shadow="m_stk1". This forces Bash to link __shadow to the
+# m_stk1 in your caller's scope. When we then ask for ${!__shadow}, Bash looks
+# at the target of that link (_example2_stk1) and returns that name.
+e_ptr_resolve() {
+  local -n __ret_ptr=$1
+  local __current_name="$2"
+
+  while true; do
+    # 1. Check if the name exists and what it is
+    local __decl
+    __decl=$(declare -p "$__current_name" 2>/dev/null) || break
+
+    # 2. If it's NOT a nameref, we've reached the end of the trail
+    [[ "$__decl" == "declare -n"* ]] || break
+
+    # 3. If it IS a nameref, we must resolve it.
+    # We bind a temporary nameref to the current name.
+    # This "reaches back" to the caller's scope.
+    local -n __shadow="$__current_name"
+    __current_name="${!__shadow}"
+  done
+
+  __ret_ptr="$__current_name"
+}
+
+## Stack operations
+# ==============================================================================
+# MODULE: stk (Generic Stack Operations using a sentinel)
+# STACK OPERATIONS (Sentinel-based)
+# ==============================================================================
+
+
+# These are a bit odd. They have a null empty - an empty at the 1st position
+# The pointer to the stack has to be resolved to test if it is genuinely an array.
+
+# is a stack empty, return 0 if so else 1
+# no sentinel for this
+e_stk_empty0() {
+  local __target_name=""
+  e_ptr_resolve __target_name "$1"
+
+  local -n __s_ref="$__target_name"
+
+  # Length 1 with empty element check
+  [[ ${#__s_ref[@]} -le 1 ]] && return 0
+  return 1
+}
+
+# e_stk_push0 (stack_ptr, value, sentinel)
+# Pushes a value. Validates that the value is NOT the sentinel.
+
+e_stk_push0() {
+  local __target_name=""
+  e_ptr_resolve __target_name "$1"
+  local __val="$2"
+
+  # Guard 1: Argument count
+  [[ $# -lt 3 ]] && e_err_fatal0 "$FUNCNAME (ptr: $1): Missing mandatory sentinel"
+
+  local __sentinel="$3"
+
+  # Guard 2: Sentinel Violation
+  [[ "$__val" == "$__sentinel" ]] && \
+    e_err_fatal0 "$FUNCNAME (ptr: $1): Cannot push value equal to sentinel [$__sentinel]"
+
+  # --- Logic ---
+  if [[ "$(declare -p "$__target_name" 2>/dev/null)" != "declare -a"* ]]; then
+    declare -ag "$__target_name"
+    local -n __s_ref="$__target_name"
+    __s_ref=('')
+  fi
+
+  local -n __s_ref="$__target_name"
+  __s_ref+=("$__val")
+}
+
+e_stk_pop0() {
+  local __target_name=""
+  e_ptr_resolve __target_name "$1"
+  local -n __dest_var="$2"
+
+  # Guard: Mandatory Sentinel
+  [[ $# -lt 3 ]] && e_err_fatal0 "$FUNCNAME (ptr: $1): Missing mandatory sentinel"
+  local __sentinel="$3"
+
+  local -n __s_ref="$__target_name"
+  if [[ ${#__s_ref[@]} -le 1 ]]; then
+    __dest_var="$__sentinel"
+    return 1
+  fi
+
+  local __last_idx=$(( ${#__s_ref[@]} - 1 ))
+  __dest_var="${__s_ref[$__last_idx]}"
+  unset "__s_ref[$__last_idx]"
+}
+
+# e_stk_peek0 (stack_ptr, dest_var, sentinel)
+# Copies top value into dest_var without unsetting.
+
+# e_stk_peek0 (stack_ptr, dest_var, sentinel)
+# Copies top value into dest_var without unsetting.
+# Fatal error if sentinel is missing. Returns 1 if stack is empty.
+e_stk_peek0() {
+  local __target_name=""
+  e_ptr_resolve __target_name "$1"
+  local -n __dest_var="$2"
+
+  # Guard: Mandatory Sentinel (Arity check)
+  [[ $# -lt 3 ]] && e_err_fatal0 "$FUNCNAME (ptr: $1): Missing mandatory sentinel"
+  local __sentinel="$3"
+
+  local -n __s_ref="$__target_name"
+
+  # Boundary: Check if stack is empty (only has the framework floor)
+  if [[ ${#__s_ref[@]} -le 1 ]]; then
+    __dest_var="$__sentinel"
+    return 1
+  fi
+
+  # Assignment: Look at the top without unsetting
+  __dest_var="${__s_ref[$(( ${#__s_ref[@]} - 1 ))]}"
+  return 0
+}
+
+# e_stk_show0 (stack_ptr, [sentinel_label])
+# Debug trace of the stack sent to FD 7.
+e_stk_show0() {
+  local __target_name=""
+  e_ptr_resolve __target_name "$1"
+  local __label="${2:-SENTINEL}"
+
+  local -n __s_ref="$__target_name"
+  local __len=${#__s_ref[@]}
+
+  {
+    echo "--- $FUNCNAME : stack trace: $1 ($__target_name) ---"
+    if [[ $__len -eq 0 ]]; then
+      echo "  [UNINITIALIZED]"
+    else
+      for (( i=__len-1; i>=0; i-- )); do
+        [[ $i -eq 0 ]] && printf "  [%2d]: %s (%s)\n" "$i" "${__s_ref[$i]}" "$__label" || \
+            printf "  [%2d]: %s\n" "$i" "${__s_ref[$i]}"
+      done
+    fi
+    echo "-----------------------"
+  } >&7
+}
+
+# Registration
+# Note: $LINENO is passed so you know exactly where the script tripped
+trap 'f_trap_err $LINENO' ERR
+
+## Logging & Cleanup Module
+# not set -u compliant
+
+# Global State Initialization for logging
+
+# Helper to generate the path that matches the systemd socket unit
+# see m_.org
+# Reconciles with systemd %t/%i-trace-fifo unit.
+# We log to the name given if that is not defined to the prog
+# But we now over-ride using d_implementation. This latter arrangement means
+# all wrappers log to the same FIFO
+# If d_implementation is defined we log to that.
+# uses a name-ref
+
+f_log_path () {
+  local -r type0="$1"
+  local -n rval="${2}"
+
+  # path may already be a socket or a fifo
+  case $type0 in
+    fifo)
+      [[ -p "$rval" ]] && return 0
+      ;;
+    sock)
+      [[ -S "$rval" ]] && return 0
+      ;;
+  esac
+
+  local base_name=""
+  if [[ -n "${3:-}" ]]; then
+    base_name="$3"
+  elif [[ -n "$d_implementation" ]]; then
+    base_name=${d_implementation##*/}
+  else
+    base_name="$prog"           # must be a global here.
+  fi
+
+  if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    # Path used by trace-fifo@.socket
+    rval="$XDG_RUNTIME_DIR/${base_name}-trace-${type0}"
+  else
+    # Standard Fallback
+    rval="/tmp/${base_name}-${type0}-${UID:-0}"
+  fi
+}
+
+f_log_init() {
+  local lvl=${_M_GLOBAL_LOG_LVL:-$1}
+  # If the user already set --log-dest, use it; otherwise, use the helper
+
+  local dest=""
+  local -a p_dest=('')
+
+  # use the global override
+  if [[ -v _M_GLOBAL_LOG_LVL ]]; then
+    if [[ "$_M_GLOBAL_LOG_LVL" > 0 ]]; then
+      if [[ -v _M_GLOBAL_LOG_DST ]]; then
+        dest="$_M_GLOBAL_LOG_DST"
+      fi
+    fi
+  fi
+
+  if [[ -n "${2:-}" ]]; then
+    dest="${2}"
+  fi
+
+  # For tcp, we re-use dest.
+  e_path_parse "${dest}" p_dest
+  local dest0="$dest"
+
+  if [[ "${p_dest[2]}" == tcp ]] || [[ "${p_dest[2]}" == tcp6 ]]  || [[ "${p_dest[2]}" == mcast ]] ; then
+    d_ERRMSG="$prog $FUNCNAME invalid URL $dest : tcp://hostname:port tcp6://hostname:port mcast://hostname:port (port is an integer 1024 to 65535)"
+    [[ -n "${p_dest[5]}" ]] || { exit 1; }
+    # Get the port from your info array
+    local -i port0="${p_dest[5]}"
+    local pattern="^[0-9]+$"
+    [[ "$port0" =~ $pattern ]] || { exit 1; }
+
+    # Optional: Check if it's within the valid range (1-65535)
+    (( port0 > 1024 )) && (( port0 <= 65535 )) || { exit 1; }
+    d_ERRMSG=""
+
+    dest="${p_dest[2]}"
+  fi
+
+  if [[ -z "$dest" ]]; then
+    f_log_path sock "dest"
+  elif [[ $dest == *"fifo" ]]; then
+    f_log_path fifo "dest"
+  elif [[ $dest == *"sock" ]]; then
+    f_log_path sock "dest"
+  fi
+
+  local final_dest=""
+  _M_FIFO_OWNED="no"
+
+  while true; do
+    if { true >&7; } 2>/dev/null; then break; fi # Inherit
+    if [[ $lvl -le 0 ]]; then final_dest="/dev/null"; break; fi
+    if [[ $lvl -eq 1 ]]; then final_dest="stderr"; break; fi
+
+    if [[ "$dest" == tcp ]] || [[ "$dest" == tcp6 ]] || [[ "$dest" == mcast ]] ; then
+      final_dest=$dest
+      break
+    fi
+
+    local ts=$(date +%FT%T.%3N)
+
+    # now use a realpath
+    dest="$(realpath "$dest")"
+
+    if [[ $dest == *"fifo"* ]] || [[ -p $dest ]]; then
+      if [[ ! -p $dest ]]; then
+        mkdir -p "${dest%/*}" 2>/dev/null
+        mkfifo -m 600 "$dest" 2>/dev/null && _M_FIFO_OWNED="yes"
+      fi
+      [[ -w $dest ]] && {
+        final_dest=$dest ;
+        printf "%s [%s:%s] (%d) Choosing FIFO: %s\n" \
+               "$ts" "$prog" "$FUNCNAME" "$$" "$final_dest" >&2 ;
+        break;
+      }
+    else
+      mkdir -p "${dest%/*}" 2>/dev/null
+      touch "$dest" 2>/dev/null
+      [[ -w $dest ]] && {
+        final_dest=$dest;
+        printf "%s [%s:%s] (%d) Choosing other: %s\n" \
+               "$ts" "$prog" "$FUNCNAME" "$$" "$final_dest" >&2
+        break;
+      }
+    fi
+
+    final_dest="stderr"
+    break
+  done
+
+  # echo "# $0 $FUNCNAME final_dest \"$final_dest\"" >&2
+  case "$final_dest" in
+    # "")          return 0 ;; # disabled Inheritance, I think
+    ""|"/dev/null") exec 7> /dev/null ;; # Inherited systems might use /dev/null
+    "stderr")    exec 7>&2 ;;
+    *fifo)
+      if [[ -p $final_dest ]]; then
+        if [[ "$_M_LOG_MODE" == perf ]]; then
+          # PERF: No timeout. Low latency no pipe overrun. Slower
+          # Script will pause (backpressure) if buffer is full.
+          exec 7> >(cat > "$final_dest" 2>/dev/null || true)
+        else
+          # SAFE: 0.1s timeout. Higher latency possible pipe overrun.
+          # Protects against hangs but fails under high stress.
+          exec 7> >(timeout 0.5 cat > "$final_dest" 2>/dev/null || true)
+        fi
+        printf "%s [%s:%s] (%d) Logging to FIFO: %s\n" \
+               "$ts" "$prog" "$FUNCNAME" "$$" "$final_dest" >&2
+      fi
+      ;;
+
+    *sock)
+      if [[ -S $final_dest ]]; then
+        exec 7> >(socat -u STDIN UNIX-CONNECT:$final_dest)
+        printf "%s [%s:%s] (%d) Logging to socket: %s\n" \
+               "$ts" "$prog" "$FUNCNAME" "$$" "$final_dest" >&7
+      fi
+      ;;
+    mcast|tcp6|tcp)
+      local proto="tcp"
+      local e_exec0=""
+      local facility=16  # local1
+
+      case "$final_dest" in
+        tcp)
+          facility=17  # local1
+          e_exec0="socat -T 2 -u - TCP4:${p_dest[0]}:${p_dest[5]},retry=3,interval=0.2 2>/dev/null"
+          ;;
+        tcp6)
+          facility=17  # local1
+          e_exec0="socat -T 2 -u - TCP6:${p_dest[0]}:${p_dest[5]},retry=3,interval=0.2 2>/dev/null"
+          ;;
+        mcast)
+          e_exec0="socat -u - UDP4-DATAGRAM:${p_dest[0]}:${p_dest[5]},ip-multicast-ttl=1 2>/dev/null"
+          proto="udp"
+          ;;
+      esac
+
+      # 2. Strip brackets from IP address if present (e.g., "[fd62:...]" -> "fd62:...")
+      local clean_addr="${p_dest[0]//[\[\]]/}"
+
+      # for the d_alert function
+      # 3. Declare e_alert_args globally (-g) as an associative array (-A)
+      declare -gA e_alert_args=(
+        ['proto']="$proto"
+        ['facility']="$facility"
+        ['addr']="$clean_addr"
+        ['port']="${p_dest[5]}"
+      )
+
+      local severity=7  # Debug
+      local pri=$(( (facility * 8) + severity ))
+      local host="${HOSTNAME}.6site0" # Domain-name host identifier
+
+      # Open FD 7 wrapped in a resilient subshell loop
+      exec 7> >(
+        # Ignore SIGPIPE inside the collector subshell so it doesn't crash on write failure
+        trap '' PIPE
+
+        while IFS='' read -r line || [[ -n "$line" ]]; do
+          if [[ "$line" =~ ^\<([0-9]{1,3})\>(.*)$ ]]; then
+            line_pri="${BASH_REMATCH[1]}"
+            msg="${BASH_REMATCH[2]}"
+          else
+            line_pri="$pri"
+            msg="$line"
+          fi
+
+          ts="$(date +"%Y-%m-%dT%H:%M:%S.%3N")"
+
+          # Use a non-fatal printf; if socat closes, pipe errors are suppressed
+          printf "<%d>%s %s %s[%d]: %s\n" \
+                 "$line_pri" "$ts" "$host" "$prog" "$$" "$msg" 2>/dev/null || true
+
+        done | { eval "$e_exec0" || true; }
+      )
+
+      # Immediate announcement header burst sent straight out to the multicast channel
+      printf "Tracing via $final_dest ${p_dest[0]} ${p_dest[5]}\n" >&7
+      final_dest=$dest0
+      ;;
+
+    *)
+      exec 7>> "$final_dest"
+      printf "%s [%s:%s] (%d) Logging to other: %s\n" \
+             "$ts" "$prog" "$FUNCNAME" "$$" "$final_dest" >&7
+      ;;
+  esac
+
+  if [[ "$lvl" -ge 2 ]]; then
+    export _M_GLOBAL_LOG_DST="$final_dest"
+  fi
+}
+
+# Ensure the trap is set immediately
+trap f_trap_exit EXIT SIGINT SIGTERM
+
+## SIGPIPE trap
+# Only needed for fifo, we now prefer to use a socket.
+# If ignored, sub-shells will error with cannot write to pipe
+# May cause issues with later use and require a reset
+#
+# actively reset - might work
+# trap 'f_log_init "${!log_lvl_v:-0}" "${!log_dest_v}"' SIGPIPE
+#
+# ignore
+trap '' SIGPIPE
+
+## Help system
+# There is a full usage and a error messaging system
+
+## This helps if the user doesn't give a command.
+d_ () {
+  h_help
+}
+
+Usage() {
+  local ex=$1
+  local h_cmd
+  shift
+
+  man m2_
+
+  printf "\nError Message:\n\t%s\n" "$@" 1>&2
+  exit $ex
+}
+
+h_help () {
+  Usage 1 "No command given"
+}
+
+d_help () {
+  h_help
+}
+
+## An alert method
+# writes to the syslog-trace
+
+f_alert_args() {
+  local status_msg
+
+  # Check if e_alert_args is set and declared as an associative array
+  if [[ $(declare -p e_alert_args 2>/dev/null) =~ "declare -A" ]]; then
+    cat <<EOF
+Status: DEFINED
+
+Configuration Details:
+  - Protocol (proto)   : ${e_alert_args['proto']}
+  - Facility (facility): ${e_alert_args['facility']}
+  - Target Addr (addr) : ${e_alert_args['addr']}
+  - Target Port (port) : ${e_alert_args['port']}"
+EOF
+  else
+    echo "Status: UNDEFINED"
+  fi
+}
+
+h_alert () {
+  cat >&2 <<EOF
+ $prog ${FUNCNAME##h_} level message-string
+
+0   emerg (panic)
+1   alert
+2   crit
+3   err (error)
+4   warning (warn)
+5   notice
+6   info
+7   debug
+
+Another method to change the facility and level is to use >&7 but with a prefix to the message: <PRI> where PRI is
+ (facility * 8) + level
+
+  printf "<130> [%s] level\n" "$FUNCNAME" >&7
+
+facility is a number
+
+16  local0, 17 local1 and so on.
+
+130 is local0.crit, 138 is local1.crit
+
+EOF
+
+  f_alert_args 2>&1
+}
+
+d_alert() {
+  # 1. Return silently if e_alert_args is undefined or not an associative array
+  [[ $(declare -p e_alert_args 2>/dev/null) =~ declare\ -[a-zA-Z]*A ]] || return 0
+
+  local sev="$1"
+  shift
+
+  # Fallback to severity 2 (crit) if $1 is missing or not a single digit 0-7
+  if [[ ! "$sev" =~ ^[0-7]$ ]]; then
+    sev=2
+  fi
+
+  # Extract facility from e_alert_args array
+  local fac="${e_alert_args['facility']}"
+
+  # Calculate numerical PRI dynamically: (facility * 8) + severity
+  local pri_val=$(( (fac * 8) + sev ))
+
+  # Get caller's function name:
+  # FUNCNAME[0] = d_alert
+  # FUNCNAME[1] = function that called d_alert
+  local caller_func="${FUNCNAME[1]:-main}"
+
+  # Write directly to FD 7 with the <PRI> prefix and calling function name
+  printf "<%d>[%s] %s\n" "$pri_val" "$caller_func" "$*" >&7
+}
+
+d_alert_log () {
+  test $# -ge 1 || return 2
+  local e_cmd="$1"
+  shift
+  (( d_count > 0 )) || (( d_count=130 ))
+  : ${d_service:=1}
+
+  case $e_cmd in
+	  priority)
+      echo "<${d_count}> local0.crit" >& 7
+      ;;
+	  alert)
+      d_alert $d_service severity ${d_service} alert
+      ;;
+    *)
+      echo "default message" >& 7
+      ;;
+  esac
+}
+
+## Script status
+# How the script has been initialized
+
+h_this0 () {
+  cat >&2 <<EOF
+ $prog [-a] ${FUNCNAME##h_} command
+
+Program: \$0 : $0 ; readlink: $(readlink $0); realpath:$(realpath $0)
+
+Commands are grouped to help explain them
+
+ Group        : Commands
+
+ support files: support|support-def|support-value
+ directory    : user|share|user0|script
+ functions    : loaded|hloaded|loaded-all
+ identity+    : identity|settings
+ developer    : mloader|vpath|version|test-alert|test-logging
+
+- Support files:
+
+ support    : locations of library scripts .sh
+ support-def : locations of definitions .def
+ support-value : contents of the .def files
+
+Links are unresolved. Listed in loaded order.
+Definitions in a later file override those in from a file before.
+
+support-def contains two system files.
+
+support-value shows the _M variables that control trace and logging.
+
+- Directory
+
+  script: the directory from which the loader script was run
+  user0: the first directory for library support script
+  user|share: the last directory
+
+- Functions
+
+These two can take the -a switch which shows the internal name and the
+internal functions, prefixed with e_
+
+  loaded: all the functions that have been loaded
+  hloaded: all the help functions
+
+  loaded-all: all the functions, including system, prefixed with f_
+
+- Identity+
+
+  identity: identity and paths of the script and its loader/executor
+  settings: the option arguments and internal variable names
+
+- Developer 
+
+  mloader: paths used to find script library and definitions
+  vpaths: paths available for the mloader
+  version: current version
+  test-alert|test-logging: tests d_alert and >&7 logging
+
+Useful for script debugging, show the support files $prog .sh and .def file contents
+'support' lists all the files .sh and .def - size must be greater than zero
+'support-def' catenates the contents of just the .def files
+
+EOF
+}
+
+
+d_this0 () {
+  test $# -ge 1 || return 2
+  local e_cmd="$1"
+  shift
+
+  case $e_cmd in
+	  support-value)
+	    echo ${FOUND_DEF[*]} | xargs -n1 | egrep '\.def$' | while read i
+	    do
+		    printf "\043 %s\n" "$i"
+        cat "$i"
+      done | sed -n '/[^[:space:]]/p'
+
+      echo '# script local'
+      set | grep -E '^(_M_)'
+	    ;;
+
+	  # xargs is limited on cygwin
+	  support-def)
+      printf "%s\n" "${FOUND_DEF[@]}"
+	    ;;
+
+    test-alert)
+      d_alert 2 alert is two
+      ;;
+    test-logging)
+      printf "<138> [%s] level\n" "$FUNCNAME:$e_cmd" >&7
+      ;;
+
+	  support)
+      printf "%s\n" "${FOUND_SH[@]}"
+      # cygwin
+	    # echo ${FOUND_SH[*]} | env -i PATH="$PATH" /usr/bin/xargs -n1
+	    ;;
+
+	  cygwin)
+		  set
+		  xargs --show-limits
+	    # echo ${D_SUP0[*]} |
+	    ;;
+
+    resolve)
+      # locate a file via readlink
+      local x0
+      : ${x0:="$1"}
+      : ${x0:="$0"}
+
+      cd "$(dirname "$(readlink -f "$x0")")"; echo $PWD
+      ;;
+
+	  sources)
+      ## this finds the sourced scripts
+      # it is set to locate the most derived script - the user's own.
+      : ${d_service:='.sh'}
+      local e_place="$"
+      if [ $d_count -gt 0 ]
+      then
+        let e_place=$d_count
+      fi
+      d_this0 support | egrep "${d_service}$" | sed -n "${e_place}p"| ( read d_file; $FUNCNAME resolve $d_file )
+      ;;
+
+    script)
+      ## this locates the top-level wrapper script.
+      $FUNCNAME resolve $0
+	    ;;
+
+    user0)
+	    local x0=$($FUNCNAME support | sed -n '1p')
+	    dirname $(readlink -f $x0)
+	    ;;
+
+    user|share)
+	    local x0=$($FUNCNAME support | sed -n '$p')
+	    dirname $(readlink -f $x0)
+      ;;
+
+    loaded)
+      : ${x_cols:=$COLUMNS}
+      : ${x_cols:=80}
+      typeset -i n_cols=${x_cols}-10
+
+      if [ -z "${d_aflag:-}" ]; then
+        compgen -A function d_ | sed -E -e 's/^d_//g' | xargs | fold -s --width="$n_cols"
+      else
+        { compgen -A function d_; compgen -A function e_;  } | xargs | fold -s --width="$n_cols"
+      fi 1>&2
+      ;;
+
+    hloaded)
+      : ${x_cols:=$COLUMNS}
+      : ${x_cols:=80}
+      typeset -i n_cols=${x_cols}-10
+
+      if [ -z "${d_aflag:-}" ]; then
+        compgen -A function h_ | sed -E -e 's/^h_//g' | xargs | fold -s --width="$n_cols"
+      else
+        { compgen -A function h_; compgen -A function e_;  } | xargs | fold -s --width="$n_cols"
+      fi 1>&2
+      ;;
+
+    loaded-all)
+      declare -F
+      ;;
+
+    mloader)
+      declare -p CLLR_VPATH
+      declare -p CLLR_BASE
+      ;;
+
+    vpath|vpaths)
+      declare -p SYS_VPATH USER_VPATH APP_VPATH CLLR_VPATH THIS_VPATH_NAME
+      ;;
+
+    settings)
+      d_settings0 $*
+      ;;
+
+    identity)
+      # The program may not be running under its true name.
+      # For example, toor_ has been redirected to toor__ using /usr/local/linux-gnu/m_x
+      echo prog=$prog
+      echo prog_dir=$prog_dir
+      echo d_interface=${d_interface:-}
+      echo d_implementation=${d_implementation:-}
+      echo "# \$0=$0"
+      ;;
+
+    version)
+      printf "Version: %s ; Description: %s ; Location: %s" "$_M__VER_" "$_M__DESC_" "$0"
+      ;;
+
+    *)
+      echo "Usage: ${FUNCNAME##d_} -h or support|support-def|support-value|support-loaded" 1>&2
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+d_recurse0 () {
+  # called directly my_pid is none
+  # called by recurse1 my_pid is PID:d_recurse1 == PID:d_recurse0
+  # called by recurse2 my_pid is PID:d_recurse2 == PID:d_recurse0 but $1 is "invoked"
+  # called by recurse3 my_pid is PID:d_recurse3 == PID:d_recurse0 but $1 is "invoked"
+  # called by recurse4 my_pid is PID:d_recurse4 != PID:d_recurse0 but $1 is "invoked"
+  echo "$FUNCNAME invoked as PID ($$) from PID ($1) : my_pid : ${my_pid:-none}"
+  [[ "$$" == "$1" ]] && echo "local"
+  [[ "$1" == "invoked" ]] && echo "invoked"
+  [[ "$1" != "invoked" ]] && [[ "$$" != "$1" ]] && echo "forked"
+  my_pid+=" - ${my_pid:-none}"
+  return 0
+}
+
+d_recurse1 () {
+  local my_pid="pid-$$"
+  echo "$FUNCNAME invoking recurse0 locally from PID ($$) from PID ($1)"
+  d_recurse0 $$
+  echo "$FUNCNAME invoked recurse0 locally and my-pid is now \"${my_pid}\""
+  return $?
+}
+
+d_recurse2 () {
+  # weird: recurse0 receives the word "invoked" as $$
+  local my_pid="pid-$$"
+  echo "$FUNCNAME invoking recurse0 function sub-shell from PID ($$) from PID ($1)"
+  $(d_recurse0 $$)
+  echo "$FUNCNAME invoked recurse0 locally and my-pid is now \"${my_pid}\""
+  return $?
+}
+
+d_recurse3 () {
+  # weird: recurse0 receives the word "invoked" as $$
+  # weird: recurse0 also receives the word "invoked" as $$
+  local my_pid="pid-$$"
+  echo "$FUNCNAME invoking recurse0 process sub-shell from PID ($$) from PID ($1)"
+  $($prog recurse0 $$)
+  echo "$FUNCNAME invoked recurse0 locally and my-pid is now \"${my_pid}\""
+  return $?
+}
+
+d_recurse4 () {
+  local my_pid="pid-$$"
+  echo "$FUNCNAME invoking recurse0 process sub-shell from PID ($$) from PID ($1)"
+  bash -c "$prog recurse0 $$"
+  echo "$FUNCNAME invoked recurse0 locally and my-pid is now \"${my_pid}\""
+  return $?
+}
+
+# display the options as set in the environment after options processed
+d_settings0 () {
+  local tag="${1:-}"
+  if [[ -z "$tag" ]]; then
+    set | grep -E -e '^(verbose|d_.+|_M_)=' | sed -E -e 's,^,# ,g'
+  elif [[ "$tag" == "all" ]]; then
+    compgen -v
+  else
+    declare -p "$tag"
+  fi
+}
+
+## Module loading
+# Optimized File Finder
+
+
+# Dynamic Module Loader
+# Usage: e_mod_loader <module_name>
+e_mod_loader() {
+  local -r mod="$1"
+  local -r vpath_name="${2:-THIS_VPATH_NAME}"
+  local -r marker="e_${mod}_load"
+
+  # 1. Idempotency Check: Is it already loaded?
+  if declare -F "$marker" >/dev/null; then
+    return 0
+  fi
+
+  echo "# Loading module [${mod}]..." >&7
+
+  local found_sh=()
+  local found_def=()
+
+  # 2. Search for configuration (.def)
+  f_mod_find "def" "$mod" "${!vpath_name}" found_def
+  for f in "${found_def[@]}"; do
+    e_fs_source0 "$f"
+  done
+
+  # 3. Search for logic (.sh)
+  f_mod_find "sh" "$mod" "${!vpath_name}" found_sh
+  if [[ ${#found_sh[@]} -eq 0 ]]; then
+    d_ERRMSG="[e_mod_loader] Module [${mod}.sh] not found in VPATH"
+    return 4
+  fi
+
+  # 4. Source the logic
+  for f in "${found_sh[@]}"; do
+    e_fs_source0 "$f"
+  done
+
+  # 5. Final Validation: Did the file actually contain the marker?
+  if ! declare -F "$marker" >/dev/null; then
+    echo "# [Warning] Module [${mod}] loaded but marker [${marker}] is missing." >&7
+  fi
+
+  return 0
+}
+
+# Finds files and populates a specific array
+# Usage: f_mod_find <ext> <module_name> <search_path_array> <out_array_name>
+f_mod_find() {
+  local ext="$1"
+  local mod="$2"
+  local -n _vpath="$3"
+  local -n _out="$4"
+
+  _out=() # Clear the output array
+
+  local dir
+  for dir in "${_vpath[@]}"; do
+    local target="${dir}/${mod}.${ext}"
+    if [[ -f "$target" ]]; then
+      _out+=("$target")
+    fi
+  done
+}
+
+# Lock function
+# Set functions as readonly
+# Protect the Framework's functions by setting them to readonly
+e_mod_lock() {
+  local tag=${1:-'^e_'}
+  local func
+
+  # Check if 'x' is present in the current shell options ($-)
+  if [[ $- == *x* ]]; then
+    (( restore_x=1 ))
+    set +x  # Turn it off
+  fi
+  # Find all functions starting with e_
+  for func in $(declare -F | awk '{print $3}' | grep $tag); do
+    readonly -f "$func"
+  done
+  # restore trace
+  if (( restore_x > 0 )); then
+    set -x
+  fi
+
+}
+
+# A helper for resolve1
+f_resolve_worker() {
+  local -n __dest_tmp="$1"
+  local -n __source_out="$2"  # NEW: Nameref for the path
+  local target_func="$3"
+  local target_file="$4"
+  local source_path="${_M__LOADR_:-}/${target_file}.sh"
+
+  [[ ! -f "$source_path" ]] && return 4
+
+  local t_file
+  t_file=$(mktemp /tmp/f_resolve.XXXXXX)
+
+  if (
+    set +u
+    source "$source_path" >/dev/null 2>&1
+    declare -f "$target_func"
+  ) > "$t_file" 2>/dev/null; then
+
+    if [[ -s "$t_file" ]]; then
+      __dest_tmp="$t_file"
+      __source_out="$source_path" # PASS BACK: The real path
+      return 0
+    fi
+  fi
+
+  [[ -f "$t_file" ]] && rm -f "$t_file"
+  return 8
+}
+
+# Refined Dynamic Function Resolver
+# Usage: d_resolve1 <function_name> [prog-name] [path_var_name]
+d_resolve1() {
+  # 1. Parameter Validation
+  if [[ $# -lt 1 ]]; then
+    d_ERRMSG="[${FUNCNAME[0]}] (Error 1): Missing required argument 'target_function'."
+    return 1
+  fi
+
+  local x_name="$1"
+  local x_file="${2:-$prog}"
+  local x_path_var="${3:-}" # Optional variable name to store the origin path
+  local f_tmp=""
+  local f_path=""
+
+  # 2. Memory Optimization: Skip if already in memory
+  if declare -F "$x_name" >/dev/null; then
+    return 0
+  fi
+
+  # 3. Environment Test
+  if [[ ! -v _M__LOADR_ ]]; then
+    d_ERRMSG="[${FUNCNAME[0]}] (Error 2): Bound variable failure. _M__LOADR_ is missing."
+    return 2
+  fi
+
+  # 4. Invoke Worker
+  # Note: f_path captures the actual source path from the worker
+  f_resolve_worker f_tmp f_path "$x_name" "$x_file"
+  local ldr_exit=$?
+
+  case $ldr_exit in
+    0)
+      # Bring function into main shell memory
+      source "$f_tmp"
+      rm -f "$f_tmp"
+
+      # If a path variable name was provided, store the path globally
+      # This allows the function to 'self-source' its origin later.
+      if [[ -n "$x_path_var" ]]; then
+        printf -v "$x_path_var" "%s" "$f_path"
+      fi
+
+      echo "# ${FUNCNAME[0]}: [${x_name}] successfully loaded from [$f_path]" >&7
+      return 0
+      ;;
+    4)
+      d_ERRMSG="[${FUNCNAME[0]}] (Error 4): Library file [${x_file}.sh] not found in ${_M__LOADR_}."
+      return 4
+      ;;
+    8)
+      d_ERRMSG="[${FUNCNAME[0]}] (Error 8): Extraction failed. Function [${x_name}] not in [${x_file}.sh]."
+      return 8
+      ;;
+    *)
+      d_ERRMSG="[${FUNCNAME[0]}] (Error ${ldr_exit}): Unexpected worker failure."
+      return "$ldr_exit"
+      ;;
+  esac
+}
+
+## Snapshot variables with a specific prefix to a persistent state file
+e_state_save() {
+  local prefix="${1:-_D_}"
+  local tmp_state=""
+
+  # 1. Path Resolution Hierarchy:
+  # 1st: Systemd-provided STATE_DIRECTORY
+  # 2nd: XDG_STATE_HOME
+  # 3rd: Standard ~/.local/state fallback
+  local base_state="${STATE_DIRECTORY:-${XDG_STATE_HOME:-$HOME/.local/state}}"
+  local state_dir="${base_state}/${prog}"
+  local state_file="${state_dir}/${prog}.def"
+
+  # 2. Directory Validation
+  if [[ ! -d "$state_dir" ]]; then
+    mkdir -p "$state_dir" || {
+      d_ERRMSG="[${FUNCNAME[0]}] Error: Could not create persistence directory [$state_dir]"
+      return 2
+    }
+  fi
+
+  # 3. Secure Payload Creation
+  # Using your nameref wrapper to track the temp file in TFILES
+  e_tpush1 tmp_state
+
+  {
+    echo "# State Snapshot: $(date +%FT%T)"
+    echo "# Program: $prog | PID: $$"
+    local var
+    # compgen -v lists all variables matching the prefix
+    for var in $(compgen -v "$prefix"); do
+      declare -p "$var"
+    done
+  } > "$tmp_state"
+
+  # 4. Atomic Commit with GNU Versioning
+  # --backup=numbered ensures we never lose the previous successful state
+  if [[ -s "$tmp_state" ]]; then
+    if cp --force --backup=numbered "$tmp_state" "$state_file" 2>/dev/null; then
+      echo "# Persistence: State archived to $state_file" >&7
+    else
+      # Fallback for non-GNU cp
+      cp -f "$tmp_state" "$state_file"
+      echo "# Persistence: State saved (Backups unavailable) to $state_file" >&7
+    fi
+  fi
+}
+
+e_state_load() {
+  local base_state="${STATE_DIRECTORY:-${XDG_STATE_HOME:-$HOME/.local/state}}"
+  local state_file="${base_state}/${prog}/${prog}.def"
+
+  if [[ -f "$state_file" ]]; then
+    # shellcheck source=/dev/null
+    source "$state_file"
+    echo "# Persistence: Variables restored from $state_file" >&7
+    return 0
+  fi
+  return 1
+}
+
+# Core logic to format variables by prefix
+# Usage: e_state_dump "_D_" > /dev/fd/7
+e_state_dump() {
+  local prefix="${1:-_M_}"
+  local var
+
+  echo "# State Dump: $(date +%FT%T) | Prefix: $prefix"
+  # compgen -v is the fastest way to filter the environment
+  for var in $(compgen -v "$prefix"); do
+    declare -p "$var" 2>/dev/null | sed 's/declare -[a-z]*r[a-z]*/declare/g'
+  done
+}
+
+# Define semantic aliases for the array indexes
+readonly _M_P_DIR=0 _M_P_FILE=1 _M_P_EXT=2 _M_P_BASE=3 _M_P_DEPTH=4
+
+# Extended Path Parser with Network Support
+# Usage: e_path_parse "tcp://127.0.0.1:17777" my_arr
+# Indexes:
+#   0 = Dir/Host  1 = File/FullAddr  2 = Ext/Scheme
+#   3 = Base      4 = Depth          5 = Port
+e_path_parse() {
+  local _path="$1"
+  local -n _out_arr="$2"
+  _out_arr=()
+
+  # --- New: Scheme Detection (TCP/Socket) ---
+  # Check if path contains '://'
+
+  if [[ "$_path" == *"://"* ]]; then 
+    local scheme="${_path%%://*}" 
+    local address="${_path#*://}" 
+
+    # 1. Separate path from the host/port authority
+    local host_port="$address"
+    local path=""
+    if [[ "$address" == */* ]]; then
+      host_port="${address%%/*}"
+      path="/${address#*/}"
+    fi
+
+    # 2. Handle Port extraction from the host_port part
+    local host="$host_port"
+    local port=""
+    if [[ "$host_port" == *":"* ]]; then
+      host="${host_port%:*}"
+      port="${host_port##*:}"
+    fi
+
+    local path_len=${#path}
+
+    _out_arr[0]="$host"        # 0: Hostname/IP 
+    _out_arr[1]="$address"     # 1: Full address (host:port/path) 
+    _out_arr[2]="$scheme"      # 2: Scheme (http, tcp, socket, etc) 
+    _out_arr[3]="$path"        # 3: Path after port (e.g., /transmission) 
+    _out_arr[4]="$path_len"    # 4: Depth (length of the path) 
+    _out_arr[5]="$port"        # 5: Port (e.g., 9091) 
+    return 0
+  fi
+
+  if [[ "$_path" =~ ^([^[:space:]]+):(.*)$ ]]; then 
+    local scheme="${BASH_REMATCH[1]}"
+    local address="${BASH_REMATCH[2]}"
+
+    local host=""
+    local port=""
+    local path=""
+
+    # Check if it has an authority section (starts with //)
+    if [[ "$address" == //* ]]; then
+        local remainder="${address#//}"
+        local host_port="$remainder"
+        
+        # Separate path from host/port if a slash exists
+        if [[ "$remainder" == */* ]]; then
+            host_port="${remainder%%/*}"
+            path="/${remainder#*/}"
+        fi
+
+        # Extract Port from host_port
+        host="$host_port"
+        if [[ "$host_port" == *":"* ]]; then
+            host="${host_port%:*}"
+            port="${host_port##*:}"
+        fi
+    else
+        # No // authority (e.g., socket:/var/run/docker.sock)
+        path="$address"
+    fi
+
+    local path_len=${#path}
+
+    _out_arr[0]="$host"        # 0: Hostname/IP (empty if no host)
+    _out_arr[1]="$address"     # 1: Address part after colon
+    _out_arr[2]="$scheme"      # 2: Scheme (http, socket, mailto, etc.)
+    _out_arr[3]="$path"        # 3: Path part
+    _out_arr[4]="$path_len"    # 4: Depth (length of the path)
+    _out_arr[5]="$port"        # 5: Port (empty if no port)
+    return 0
+fi
+
+  # --- Original Filesystem Logic ---
+
+  # 1. Directory (dirname)
+  local d="${_path%/*}"
+  [[ "$d" == "$_path" ]] && d="."
+  _out_arr[0]="$d"
+
+  # 2. Full Filename (basename)
+  local f="${_path##*/}"
+  _out_arr[1]="$f"
+
+  # 3. Extension (extname)
+  local e="${f##*.}"
+  [[ "$e" == "$f" ]] && e=""
+  _out_arr[2]="$e"
+
+  # 4. Filebase (Name without extension)
+  _out_arr[3]="${f%.*}"
+
+  # 5. Depth
+  if [[ "$d" == "." ]]; then
+    _out_arr[4]=0
+  elif [[ "$d" == "/" ]]; then
+    _out_arr[4]=1
+  else
+    local slashes="${d//[^\/]}"
+    _out_arr[4]="${#slashes}"
+  fi
+
+  _out_arr[5]="" # 5: No Port for files
+}
+
+## File System: Source with Validation
+# $1: Full path to the file
+e_fs_source0() {
+  local __file="$1"
+
+  # 1. Existence check
+  [[ ! -f "$__file" ]] && e_err_fatal0 "e_fs_source0: File not found [$__file]"
+
+  # 2. Syntax Pre-flight (using bash -n)
+  # This catches syntax errors without executing the file.
+  local __err_out
+  if ! __err_out=$(bash -n "$__file" 2>&1); then
+    e_err_report0 "Syntax error in [$__file]"
+    {
+      echo "------------------------------------------------"
+      echo "FILE: $__file"
+      echo "ERR : $__err_out"
+      echo "------------------------------------------------"
+      echo "$d_ERRMSG"
+    } >&2
+    exit 3
+  fi
+
+  # 3. Execution (The actual source)
+  # We wrap this in a subshell-like check if you want to catch
+  # runtime errors during the source itself.
+  if [[ "${VERBOSE:-}" == "yes" ]]; then
+    echo "  [load] $__file" >&7
+  fi
+
+  source "$__file"
+}
+
+# e_fsstk_reset (stack_ptr, register_ptr, sentinel)
+# Truncates all writable files in register and repopulates the stack with them.
+## File stack - reset
+# $1: Pointer to the Stack (e.g., m_stk1 or m_fsstk)
+# $2: Pointer to the File Register (e.g., m_fs or _example2_f)
+# $3: The Sentinel value for the stack
+# Non-writable files are not zeroed
+# Only zero-length files are pushed
+# Note: so one can mark a zero-length file as read-only, eg. a lock file.
+e_fsstk_reset() {
+  local __stk_ptr="$1"
+  local __reg_ptr="$2"
+  local __sntl="$3"
+  local __stk_name="" __reg_name=""
+  e_ptr_resolve __stk_name "$__stk_ptr"
+  e_ptr_resolve __reg_name "$__reg_ptr"
+
+  unset "$__stk_name"
+  declare -ag "$__stk_name"
+  eval "$__stk_name=('')"
+
+  local -n __files_ref="$__reg_name"
+  for __f_path in "${__files_ref[@]}"; do
+    if [[ -f "$__f_path" && -w "$__f_path" ]]; then
+      : > "$__f_path"
+      [[ ! -s "$__f_path" ]] && e_stk_push0 "$__stk_name" "$__f_path" "$__sntl"
+    fi
+  done
+}
+
+## Running commands in their own environment
+# There's been a problem that calling methods directly (using their d_path)
+# usually means they use the global values of d_file and d_dir. These have to unset
+# then set to new values.
+# To avoid this e_env is provided. It creates a namespace environment and populates it
+# with empty settings for d_file and the others in the namespace.
+
+# --- Global Configuration ---
+# All supported variable suffixes for the namespaces.
+# Added 'output' to the list to support the -O flag.
+
+# --- Namespace Initialization ---
+# Ensures global storage exists for a namespace and initializes to safe defaults.
+# Usage: e_env_init <namespace> [use_defaults_flag]
+e_env_init() {
+  local ns=$1
+  local _use_default="${2:-}"
+
+  for var in "${_M__VARS_[@]}"; do
+    local gvar="_${ns}_${var}"
+    if [[ ! -v "$gvar" ]]; then
+      declare -ag "$gvar"
+
+      local default_value=""
+
+      # Determine default value only if explicitly requested
+      if [[ -n "${_use_default:-}" ]]; then
+        local d_val_name="d_${var}"
+
+        # Handle specific defaults for numbers or special strings
+        case "$var" in
+          count)    default_value=${d_count:-"-1"} ;;
+          user)     default_value=${d_user:-${USER:-${LOGNAME:-$(id -un)}}} ;;
+          *)        default_value="${!d_val_name:-""}" ;;
+        esac
+      fi
+
+      # Use printf -v to assign safely in a set -u environment
+      printf -v "${gvar}[0]" "%s" "$default_value"
+    fi
+  done
+}
+
+# Settings Capture (Test Function)
+d_settings1() {
+  # $1: Nameref to the associative array
+  local -n _target_array="$1"
+  shift || true
+
+  # Using nameref to global configuration list
+  local -n v_list="_M__VARS_"
+
+  for var in "${v_list[@]}"; do
+    local d_var_name="d_${var}"
+
+    if [[ -v "$d_var_name" ]]; then
+      _target_array["$d_var_name"]="${!d_var_name}"
+    else
+      _target_array["$d_var_name"]=""
+    fi
+  done
+  echo "# $FUNCNAME extra-args : \"$@\""
+}
+
+# --- Namespace Export ---
+# Reverses initialization: Takes values FROM the namespace and EXPORTS them
+# to the environment as d_<var> variables.
+# Usage: e_env_export <namespace>
+e_env_export() {
+  local ns=$1
+
+  # Validation
+  if [[ ! -v "_${ns}_dir" ]]; then
+    echo "Error: Namespace '$ns' not initialized."
+    return 1
+  fi
+
+  # Reference the global list via nameref for internal use
+  local -n v_list="_M__VARS_"
+
+  for var in "${v_list[@]}"; do
+    local gvar="_${ns}_${var}[0]"
+    local env_var="d_${var}"
+
+    # Export the value from the namespace array to the d_ environment variable
+    export "$env_var"="${!gvar}"
+  done
+}
+
+# --- Namespace Debug/Show Helper ---
+e_env_show () {
+  local ns=$1
+  for var in "${_M__VARS_[@]}"; do
+    local gvar="_${ns}_${var}"
+    if [[ ! -v "$gvar" ]]; then
+      echo "# $FUNCNAME not found : $gvar"
+      continue
+    fi
+    echo "# $FUNCNAME found : $gvar : value : ${!gvar}"
+  done
+}
+
+# --- The Context Provider (Execution Wrapper) ---
+# Usage: e_env [options] <namespace> <function_name> <output_array_name> [--] [args]
+# Utilizes util-linux getopt for robust parsing and long-option support.
+e_env() {
+  # 1. Setup getopt
+  # -o is for options, -O is for output
+  local SHORT="d:f:c:P:l:u:e:o:O:p:r:a:s:"
+  local LONG="dir:,file:,count:,pass:,log:,user:,exec:,options:,output:,port:,ref:,aflag:,service:"
+
+  local PARSED
+  PARSED=$(getopt --options=$SHORT --longoptions=$LONG --name "e_env" -- "$@")
+  [[ $? -ne 0 ]] && return 1
+
+  # Normalize positional parameters
+  eval set -- "$PARSED"
+
+  # Temporary storage for options parsed from CLI
+  local opt_dir="" opt_file="" opt_count="" opt_pass="" opt_log=""
+  local opt_user="" opt_exec="" opt_opts="" opt_out="" opt_port=""
+  local opt_ref="" opt_aflag="" opt_service=""
+
+  # 2. Process Options
+  while true; do
+    case "$1" in
+      -d|--dir)     opt_dir="$2";     shift 2 ;;
+      -f|--file)    opt_file="$2";    shift 2 ;;
+      -c|--count)   opt_count="$2";   shift 2 ;;
+      -P|--pass)    opt_pass="$2";    shift 2 ;;
+      -l|--log)     opt_log="$2";     shift 2 ;;
+      -u|--user)    opt_user="$2";    shift 2 ;;
+      -e|--exec)    opt_exec="$2";    shift 2 ;;
+      -o|--options) opt_opts="$2";    shift 2 ;;
+      -O|--output)  opt_out="$2";     shift 2 ;; # Handle the new -O flag
+      -p|--port)    opt_port="$2";    shift 2 ;;
+      -r|--ref)     opt_ref="$2";     shift 2 ;;
+      -a|--aflag)   opt_aflag="$2";   shift 2 ;;
+      -s|--service) opt_service="$2"; shift 2 ;;
+      --)           shift; break ;;
+      *)            break ;;
+    esac
+  done
+
+  # 3. Extract Identifiers
+  local ns="$1"
+  local func="$2"
+  local out_ref="$3"
+  shift 3 || { echo "Error: Missing namespace, func, or out_ref"; return 1; }
+
+  # 4. Namespace Validation
+  if [[ ! -v "_${ns}_dir" ]]; then
+    echo "Error: Namespace '$ns' not initialized. Call e_env_init '$ns' first."
+    return 1
+  fi
+
+  # 5. Create local namerefs and 6. Update Sticky State
+  for var in "${_M__VARS_[@]}"; do
+    local gvar="_${ns}_${var}[0]"
+    local -n n_ref="$gvar"
+
+    case "$var" in
+      dir)      [[ -n "$opt_dir" ]]     && n_ref="$opt_dir" ;;
+      file)     [[ -n "$opt_file" ]]    && n_ref="$opt_file" ;;
+      count)    [[ -n "$opt_count" ]]   && n_ref="$opt_count" ;;
+      password) [[ -n "$opt_pass" ]]    && n_ref="$opt_pass" ;;
+      log)      [[ -n "$opt_log" ]]     && n_ref="$opt_log" ;;
+      user)     [[ -n "$opt_user" ]]    && n_ref="$opt_user" ;;
+      exec)     [[ -n "$opt_exec" ]]    && n_ref="$opt_exec" ;;
+      options)  [[ -n "$opt_opts" ]]    && n_ref="$opt_opts" ;;
+      output)   [[ -n "$opt_out" ]]     && n_ref="$opt_out" ;;
+      port)     [[ -n "$opt_port" ]]    && n_ref="$opt_port" ;;
+      ref)      [[ -n "$opt_ref" ]]     && n_ref="$opt_ref" ;;
+      aflag)    [[ -n "$opt_aflag" ]]   && n_ref="$opt_aflag" ;;
+      service)  [[ -n "$opt_service" ]] && n_ref="$opt_service" ;;
+    esac
+
+    # 7. Injection: Create local d_<var> for the target function
+    printf -v "d_${var}" "%s" "$n_ref"
+  done
+
+  # 8. Exec Target Function
+  "$func" "$out_ref" "$@"
+}
+
+## Initialization
+: ${TMPDIR:=/tmp}
+export TMPDIR
+: ${TMP:=/tmp}
+export TMP
+
+# function error level by default always return failure
+typeset -i err_level=${err_level:- -1}
+
+## Logging destination default
+# default logging path is now a fifo
+
+# used to hold temporary files - see f_tpush and f_trap_exit and the trap
+TFILES=()
+
+# Example:
+# This is safe even if TFILES is empty and set -u is on
+# for file in "${TFILES[@]:-}"; do
+#  echo "$file"
+# done
+
+: ${PERL:=$(which perl)}
+: ${AWK:=$(which gawk)}
+
+## Options parameters
+
+: ${d_helpflag:=""}             # this is the flag that is set in options there is a d_help function
+: ${d_aflag:=""}
+
+# These are the default empty values and are set in the environment ready for set -o nounset
+: ${d_password:=""}
+: ${d_log:=""}                  # a logfile to use in code
+: ${d_output:=""}               # a file or a device
+: ${d_port:=""}                 # a number
+: ${d_ref:=""}                  # a file
+
+# These need default values for post-processing
+: ${d_user:=$USER}
+: ${d_user:=$LOGNAME}
+: ${d_user:=`id -un`}
+: ${d_machine:=${HOSTNAME%%.*}}  # a short hostname
+
+# These can be single values or assignments viz. VIEWER=evince
+: ${d_options:=""}
+: ${d_exec:=""}                 # a program to use or a string of assignment
+: ${d_orchestrate:=}            # a list of sub-commands to call
+: ${d_stateful:=0}              # whether to load and use the state machine
+typeset -i d_count=-1
+
+# TODO set these to defaults for when set -u is activated
+: ${d_dir:=""}
+: ${d_file:=""}
+: ${d_service:=""}
+
+## Resets
+# Our caller may have set these - for subscripts we turn them off
+nodo=""                         #  either "" or echo - prefixes a command to allow a non-destructive run
+
+# f_log_init redirects something to /dev/fd/7
+declare -r verbose=/dev/fd/7
+# Old way is this and is slower, it opens and closes
+#  echo filename is myfile > $verbose
+# New way is this and faster, it uses a buffer
+#  echo filename is myfile >&7
+
+# Indirect
+# Used extensively - the logging settings are spcific to $prog so we hold them in these variables
+log_lvl_v="${prog}_logging_lvl"
+log_dest_v="${prog}_logging_dest"
+
+# Store all the arguments
+d_args="$*"
+
+## Options
+# we now use util-linux getopt that supports long options
+
+# 1. Define the options strings
+# Short options: 'o:' means -o takes an argument. 'v' means -v does not.
+declare -r SHORT_OPTS="O:P:ahqnvxd:f:o:l:u:p:r:m:c:s:e:V:"
+# Long options: 'log-dst:' means --log-dst takes an argument. 'log' means --log does not.
+declare -r LONG_OPTS="verbose,quiet,help,dry-run,log,log-dest:,log-deep:,orchestrate:,stateful"
+
+# 2. Use getopt to parse and "normalize" the arguments
+# The -- "$@" handles spaces in filenames correctly.
+declare -r PARSED_OPTS=$(getopt -o "$SHORT_OPTS" --long "$LONG_OPTS" -n "$prog" -- "$@")
+if [ $? -ne 0 ]; then
+  Usage 2 "Invalid switch specified - abort."
+fi
+
+# 3. Replace the current positional parameters ($1, $2, etc.) with the parsed ones
+eval set -- "$PARSED_OPTS"
+
+# 4. Process options in a while loop
+while true; do
+  case "$1" in
+    -h|--help)
+      d_helpflag="yes"; shift ;;
+    -x)
+      xtrace="yes"; shift ;;
+    -q|--quiet)
+      d_quiet="yes"; VERBOSE="";
+      # could be, but default to f_log_init
+      # printf -v "${prog}_logging_lvl" "0"
+      shift ;;
+    -a|--alternative)
+      d_aflag="yes"; shift ;;
+    -n|--dry-run)
+      nodo="echo "; shift ;;
+
+    # New Long Options examples
+    -v|--verbose)
+      d_quiet=""
+      # Level 1 signals "Standard Error"
+      printf -v "${prog}_logging_lvl" "1"
+      shift ;;
+    --log)
+      d_quiet=""
+      # Level 2 signals "FIFO/File"
+      printf -v "${prog}_logging_lvl" "2"
+      shift ;;
+    --log-dest)
+      d_quiet=""
+      printf -v "${prog}_logging_dest" "%s" "$2"
+      # If they provide a destination, we assume they want FIFO/File logic
+      printf -v "${prog}_logging_lvl" "2"
+      shift 2 ;;
+
+    --orchestrate)
+      d_orchestrate="$2"; shift 2 ;;
+
+    --stateful)
+      d_stateful=1; shift ;;
+
+    -V|--log-deep)
+      # Level-based deep logging - child processes will inherit this and log as well.
+      export _M_GLOBAL_LOG_LVL="${2:-1}"
+      shift 2 ;;
+
+    # Existing short options
+    -o) d_options="$2"; shift 2 ;;
+    -r) d_ref="$2"; shift 2 ;;
+    -l) d_log="$2"; shift 2 ;;
+    -d) d_dir="$2"; shift 2 ;;
+    -f) d_file="$2"; shift 2 ;;
+    -s) d_service="$2"; shift 2 ;;
+    -u) d_user="$2"; shift 2 ;;
+    -p) d_port="$2"; shift 2 ;;
+    -P) d_password="$2"; shift 2 ;;
+    -c) d_count=$2; shift 2 ;;
+    -m) d_machine="$2"; shift 2 ;;
+    -O) d_output="$2"; shift 2 ;;
+    -e) d_exec="$2"; shift 2 ;;
+
+    --) # End of options
+      shift; break ;;
+    *)
+      Usage 2 "Internal error during parsing." ;;
+  esac
+done
+
+
+# No more 'expr $OPTIND - 1' needed!
+# 'eval set -- "$PARSED_OPTS"' and the 'shift' logic inside the loop
+# already cleaned up the arguments. Now $1 is your command/function name.
+
+## Function library and definition files
+# Define the Search Paths - The VPATHs
+
+# the machine the script is running on - d_machine is for the developer/user
+: ${machine_name:=$(hostname -s)}
+
+# Set the path from the source link of $0
+CLLR_VPATH=""
+CLLR_BASE=""
+f_vpath_mldr CLLR_VPATH CLLR_BASE
+
+# System: Wide to Narrow : vendor - site -
+SYS_VPATH=(
+  "/usr/local/etc"
+  "/usr/local/share/site/cluster"
+  "/usr/local/share/site/$machine_name"
+)
+
+# User: System paths + Home overrides - these use a user-specified machine
+# by d_machine or the default. When it is user-specified it can be in the environment.
+USER_VPATH=(
+  "${SYS_VPATH[@]}"
+  "$HOME/etc"
+  "$HOME/share/site/cluster"
+  "$HOME/share/site/${d_machine:-${machine_name}}"
+)
+
+# App: Local directory + Machine sub-dir
+# this one uses the user's choice of machine.
+# d_service may be empty so and d_user avoid a duplicate
+# Other directories may be protected
+APP_VPATH=(
+  "$prog_dir"
+  "$prog_dir/$d_user"
+  "$prog_dir/$d_service"
+  "$prog_dir/$d_machine"
+)
+
+# simplify the paths
+f_vpath_unique CLLR_VPATH
+f_vpath_unique SYS_VPATH
+f_vpath_unique USER_VPATH
+f_vpath_unique APP_VPATH
+
+# --- Logic to select the active VPATH name ---
+if [[ "$prog" == *__ ]]; then
+  THIS_VPATH_NAME="SYS_VPATH"
+elif [[ "$prog" == *_ ]]; then
+  THIS_VPATH_NAME="USER_VPATH"
+else
+  THIS_VPATH_NAME="APP_VPATH"
+fi
+
+# Arrays to store found files in load order
+FOUND_SH=()
+FOUND_DEF=()
+
+# Load them in order
+# vendor
+f_vpath_files sh $CLLR_BASE CLLR_VPATH
+f_vpath_files def $CLLR_BASE CLLR_VPATH
+
+# site and/or user
+f_vpath_def
+f_vpath_sh
+
+declare -r FOUND_SH
+declare -r FOUND_DEF
+
+# TODO
+# Not needed in production
+# [[ $VERBOSE == yes ]] && declare -p FOUND_SH
+# [[ $VERBOSE == yes ]] && declare -p FOUND_DEF
+# [[ $VERBOSE == yes ]] && [[ $xtrace == yes ]] && d_settings0
+
+## Lock all the functions so far
+# This prevents overwriting when the user code is loaded
+e_mod_lock '^f_'
+e_mod_lock '^e_'
+e_mod_lock '^d_'
+
+# logging is to stderr during boot-strapping
+# Load the .def files which may define a logging destination of their own
+
+# Source the .def files
+for f in "${FOUND_DEF[@]}"; do
+  e_fs_source0 "$f"
+done
+
+# Assess all the logging variables
+
+# Now that _M__TRACE_ and getopt have both had their say,
+# we finalize the state of the VERBOSE variable:
+VERBOSE=$(e_is_logging)
+
+# Post-processing for options -o and executable -e.
+# runs here as another way to set _M__TRACE_
+# These provide another way to set logging
+[ -n "${d_options:-}" ] && d_evlr d_options
+[ -n "${d_exec:-}" ] && d_evlr d_exec
+
+# if a _M__TRACE_ variable exists use that to set switches
+
+if [[ -n ${_M__TRACE_:-} ]]; then
+  [[ "$_M__TRACE_" == *n* ]] && nodo="echo "
+  [[ "$_M__TRACE_" == *x* ]] && xtrace="yes"
+  [[ "$_M__TRACE_" == *p* ]] && nnunset="yes"
+
+  # New 'v' flag logic: set to Level 1 (Stderr) if not already set
+  if [[ $_M__TRACE_ == *v* ]]; then
+    # If the value is empty/unset, set it to 1
+    if [[ -z ${!log_lvl_v} ]]; then
+      printf -v "$log_lvl_v" "1"
+    fi
+  fi
+
+  # New 'l' flag logic: set to Level 2 (FIFO)
+  if [[ $_M__TRACE_ == *l* ]]; then
+    printf -v "$log_lvl_v" "2"
+  fi
+fi
+
+_M_LOG_MODE="safe"
+# In your flag processing logic
+if [[ "$_M__TRACE_" == *!* ]]; then
+  _M_LOG_MODE="perf"
+  printf -v "$log_lvl_v" "2"
+fi
+
+## Logging
+# All the different ways to configure logging have been loaded, so it can be started
+# These use the indirect lookups - default is logging off
+# and if logging is on, and nothing else specified it will use a pipe
+# reset file descriptor 7 and set up the user's logging
+
+if (( _M__LOG_ == 0 )); then
+  exec 7>&-
+  f_log_init "${!log_lvl_v:-0}" "${!log_dest_v}"
+fi
+
+# Finally source the log files - errors will go to log dest.
+# Source the .sh files
+for f in "${FOUND_SH[@]}"; do
+  e_fs_source0 "$f"
+done
+
+# 6. Kickoff
+# User scripts should have been loaded see VPATH
+# errors here sometimes indicate a name clash - one of the user functions
+# has clashed with one of the system's
+f_main "$@"
+exit $err_level

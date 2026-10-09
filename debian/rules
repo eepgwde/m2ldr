@@ -1,0 +1,7 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_usrlocal:
+	# Skip dh_usrlocal so it doesn't crash when shipping files in /usr/local

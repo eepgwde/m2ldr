@@ -1,0 +1,7 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: m2ldr
+Source: https://example.com/myscript
+
+Files: *
+Copyright: 2026 Walter Eaves <walter.eaves@bigfoot.com>
+License: MIT

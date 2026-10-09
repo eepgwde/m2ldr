@@ -1,0 +1,3 @@
+bin/m2_ usr/local/bin/
+share/cluster/m2_.def usr/local/share/cluster/
+share/man/man1/m2_.1 usr/local/share/man/man1/

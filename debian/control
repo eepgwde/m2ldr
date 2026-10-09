@@ -1,0 +1,13 @@
+Source: m2ldr
+Section: utils
+Priority: optional
+Maintainer: Walter Eaves <walter.eaves@bigfoot.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+
+Package: m2ldr
+Architecture: all
+Depends: ${misc:Depends}, bash (>= 4.0)
+Description: Short description of your shell script
+ Longer multi-line description explaining what your shell script 
+ and support files do in detail.

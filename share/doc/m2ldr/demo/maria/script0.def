@@ -1,0 +1,3 @@
+DEF1=second-def
+#_M_GLOBAL_LOG_DST=$PWD/$prog.log
+# _M_GLOBAL_LOG_LVL=1

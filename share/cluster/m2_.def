@@ -1,0 +1,12 @@
+: ${_M__TRACE_:="-"}
+
+# Logging using syslog-ng
+# : ${_M_GLOBAL_LOG_DST:=tcp://syslog.site0:17777}
+# : ${_M_GLOBAL_LOG_DST:=tcp6://syslog.site0:17777}
+# : ${_M_GLOBAL_LOG_DST:="mcast://239.255.0.2:17777"}
+# : ${_M_GLOBAL_LOG_LVL:=2}
+
+# safe configuration
+: ${_M_GLOBAL_LOG_DST:=$HOME/m2_.log}
+# logging is off
+: ${_M_GLOBAL_LOG_LVL:=0}
