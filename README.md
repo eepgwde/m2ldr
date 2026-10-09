@@ -22,8 +22,8 @@ the scripts that will load libraries.
 To use the implementation as another script, simply link *m2\_* to
 another name. There is a demonstration script in share/doc/m2ldr/demo.
 
-To use it, in m2ldr/demo directory, make this link `ln -s $(which m2_)
-script0`{.verbatim}
+To use it, in m2ldr/demo directory, make this link
+`ln -s $(which m2\_) script0`
 
 And you should be able to work through the m2\_.md file.
 
@@ -39,8 +39,7 @@ Utilities include path-parsing for file paths and URLs. A stack
 mechanism that is used to implement temporary file management.
 
 The most useful feature is the syslog compliant logging system, that
-uses a numbered file descriptor:
-`echo $FUNCNAME: logging message >& 7`{.verbatim}
+uses a numbered file descriptor: `echo $FUNCNAME: logging message >& 7`
 
 All of which makes it a very convenient and powerful way of running and
 maintaining a large code-base of BASH scripts.
